@@ -1,5 +1,12 @@
 CC = qcc
-CFLAGS = -Vgcc_ntoaarch64le -Wall -O2 -I../rpi-gpio/resmgr/public
+CFLAGS = -Vgcc_ntoaarch64le -Wall -O2
+
+# rpi_gpio.h comes from the rpi-gpio project. In the monorepo this was
+# -I../rpi-gpio/resmgr/public, a path to a sibling directory that does not exist
+# now each application has its own repository. The build system passes the
+# include directory in instead: meta-qnx-hyp DEPENDS on rpi-gpio and points this
+# at the sysroot the header is staged into.
+CFLAGS += $(EXTRA_CFLAGS)
 LDFLAGS = -lm
 
 BUILD_DIR = build
