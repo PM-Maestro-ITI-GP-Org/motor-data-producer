@@ -1,0 +1,28 @@
+{
+  "pi": {
+    "spi_bus": 0,
+    "spi_dev": 0,
+    "spi_mode": 0,
+    "spi_clock_hz": 8000000,
+    "spi_cpha": 0,
+    "spi_word_width": 8,
+    "spi_idle_insert": 0,
+    "rt_priority": 30,
+    "dataready_pin": 17,
+    "scaling": {
+      "current_scale":  1.0,
+      "current_offset": 0.0,
+      "vib_scale":      1.0,
+      "vib_offset":     0.0,
+      "rpm_scale":      1.0,
+      "rpm_offset":     0.0
+    }
+  },
+  "stm": {
+    "block_rows": 200,
+    "source": "adc",
+    "run_state": "run",
+    "sample_rate_hz": 20000,
+    "imu_rate_hz": 1000
+  }
+}
