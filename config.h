@@ -40,6 +40,7 @@ typedef struct {
     int      spi_word_width;   /* 8, 16, or 32; STM expects 8                 */
     int      spi_idle_insert;  /* 0 or 1                                       */
     int      rt_priority;
+    int      cpu_affinity;      /* -1 = no pinning, 0..N = pin to that core */
     int      dataready_pin;
 
     /* scaling: engineering units = raw * scale + offset. Applied downstream

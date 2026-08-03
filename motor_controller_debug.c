@@ -79,20 +79,22 @@ typedef struct {
     int      spi_mode;
     uint32_t spi_clock_hz;
     uint16_t block_rows;
+    uint32_t sample_rate_hz;
     long     period_ns;
     int      rt_priority;
     int      dataready_pin;
 } controller_config_t;
 
 static const controller_config_t DEFAULT_CFG = {
-    .spi_bus       = 0,
-    .spi_dev       = 0,
-    .spi_mode      = 0,
-    .spi_clock_hz  = 1000000u,   /* DEBUG: 1 MHz to rule out F401 slave timing */
-    .block_rows    = 200,
-    .period_ns     = 10L * 1000L * 1000L,
-    .rt_priority   = 30,
-    .dataready_pin = 17,
+    .spi_bus        = 0,
+    .spi_dev        = 0,
+    .spi_mode       = 0,
+    .spi_clock_hz   = 1000000u,   /* DEBUG: 1 MHz to rule out F401 slave timing */
+    .block_rows     = 200,
+    .sample_rate_hz = 20000u,
+    .period_ns      = 10L * 1000L * 1000L,
+    .rt_priority    = 30,
+    .dataready_pin = 27,
 };
 
 /* ============================ diagnostics ================================= */
@@ -379,7 +381,7 @@ int main(void)
             const motor_row_t *rows = (const motor_row_t *)(rx + sizeof(frame_header_t));
             motor_snapshot_publish(&region->snapshot, &rows[h->n_rows - 1],
                                    h->seq, h->timestamp, h->flags);
-            motor_ring_publish(&region->ring, h, rows);
+            motor_ring_publish(&region->ring, h, rows, cfg.sample_rate_hz);
             st.frames_ok++;
         }
     }

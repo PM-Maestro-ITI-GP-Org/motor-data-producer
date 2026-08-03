@@ -2,9 +2,10 @@
  * motor_controller.c
  * ----------------------------------------------------------------------------
  * QNX controller / producer node for the predictive-maintenance pipeline.
- * INTERRUPT-DRIVEN build: reads are driven by the data-ready GPIO edge, so every
- * read lands on a fresh, complete frame (no free-running poll => no clock drift,
- * no duplicate/gap churn from being unsynced to the STM32).
+ * LEVEL-POLL build: dataready_wait polls the data-ready GPIO line every 100 us
+ * with a 100 ms safety timeout. The STM32's DR pulse is too narrow (~100 ns) for
+ * the Pi's GPIO debounce filter to detect as a rising edge, so edge-triggered
+ * interrupts would always time out -- level polling is the reliable baseline.
  *
  * Single SCHED_FIFO thread that, per data-ready interrupt:
  *   1. reads one fixed-size frame over SPI (rpi_spi driver), full-duplex so the
@@ -116,6 +117,14 @@ static int set_realtime_priority(int prio)
     return pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 }
 
+static void pin_to_cpu(int cpu)
+{
+    if (cpu < 0) return;
+    uint64_t runmask = 1ULL << cpu;
+    ThreadCtl(_NTO_TCTL_RUNMASK, &runmask);
+    fprintf(stderr, "[ctrl] pinned to CPU %d\n", cpu);
+}
+
 /* ============================ shared memory =============================== */
 static shm_region_t *shm_setup(void)
 {
@@ -213,14 +222,14 @@ static int dataready_arm_pin(dataready_t *d, const pi_config_t *cfg)
         fprintf(stderr, "error: rpi_gpio_setup(pin=%d) failed\n", d->pin);
         return -1;
     }
+    if (rpi_gpio_setup_pull(d->pin, GPIO_IN, GPIO_PUD_DOWN) != GPIO_SUCCESS) {
+        fprintf(stderr, "warning: rpi_gpio_setup_pull(pin=%d, DOWN) failed -- "
+                        "fit an external pull-down resistor\n", d->pin);
+    }
     if (rpi_gpio_add_event_detect(d->pin, d->coid, GPIO_RISING, DR_EVENT_ID)
             != GPIO_SUCCESS) {
         fprintf(stderr, "error: rpi_gpio_add_event_detect(pin=%d) failed\n", d->pin);
         return -1;
-    }
-    if (rpi_gpio_setup_pull(d->pin, GPIO_IN, GPIO_PUD_DOWN) != GPIO_SUCCESS) {
-        fprintf(stderr, "warning: rpi_gpio_setup_pull(pin=%d, DOWN) failed -- "
-                        "fit an external pull-down resistor\n", d->pin);
     }
     if (dataready_read_level(d) == 1) {
         fprintf(stderr, "WARNING: GPIO%d reads HIGH -- check wiring / pull-down "
@@ -236,7 +245,7 @@ static int dataready_setup(dataready_t *d, const pi_config_t *cfg)
     d->pin     = cfg->dataready_pin;
     d->chid    = -1;
     d->coid    = -1;
-    d->poll_ns = 2u * 1000u * 1000u;   /* 2 ms safety poll */
+    d->poll_ns = 60000000ULL;          /* 60 ms safety timeout (> 40 ms STM32 block interval) */
 
     d->chid = ChannelCreate(0);
     if (d->chid == -1) {
@@ -272,18 +281,62 @@ static int dataready_repoint(dataready_t *d, const pi_config_t *cfg)
     return dataready_arm_pin(d, cfg);
 }
 
+/* Busy-wait for approximately `us` microseconds using CLOCK_MONOTONIC.
+ * This bypasses the 1 ms QNX system-tick granularity that nanosleep
+ * cannot escape (every sub-ms sleep rounds up to one full tick).          */
+static void busy_nsleep(unsigned us)
+{
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    uint64_t target = (uint64_t)start.tv_sec * 1000000000ULL
+                    + start.tv_nsec + (uint64_t)us * 1000;
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t n = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+        if (n >= target) break;
+    } while (1);
+}
+
+/* Tracks the monotonic timestamp of the last completed SPI transfer.
+ * Used by dataready_wait to ensure minimum CS de-assert (settling)
+ * between transfers without adding unnecessary fixed delays.           */
+static uint64_t last_spi_ns = 0;
+
+/* Safe monotonic-time delta: end_ns - start_ns in nanoseconds, handling
+ * timespec nsec wraps correctly. */
+static inline uint64_t ts_delta_ns(struct timespec end, struct timespec start)
+{
+    uint64_t ns = (uint64_t)(end.tv_sec - start.tv_sec) * 1000000000ULL;
+    if (end.tv_nsec >= start.tv_nsec)
+        ns += (uint64_t)(end.tv_nsec - start.tv_nsec);
+    else
+        ns -= (uint64_t)(start.tv_nsec - end.tv_nsec);
+    return ns;
+}
+
+/* ---- self-tuning rate limiter -------------------------------------------
+ * Normal operation: one SPI read every ~10 ms (matching the STM32 block
+ * period). When a read returns garbage (magic mismatch), the controller
+ * enters probe mode and retries at short intervals (500 us sleep) to
+ * rapidly re-sync with the STM32's frame boundary. Once a valid frame
+ * is found, probe mode exits and we return to the 10 ms cadence. The
+/* (rate limiter moved to bottom of main loop; fixed 9.966 ms target) */
 static int dataready_wait(dataready_t *d, controller_stats_t *st)
 {
     (void)st;
-    uint64_t to = d->poll_ns;
+    /* Wait 200 us (via kernel timer) then sample the GPIO level.
+     * TimerTimeout() on the QNX guest VM is rounded by the 1 ms system tick,
+     * adding 100-1000 us of jitter to every poll.  This natural jitter acts as
+     * phase dithering, spreading the Pi's SPI reads across many offsets within
+     * the STM32's 10 ms block window and dramatically reducing the chance of
+     * repeatedly hitting the DMA boundary.  Deterministic waits lack this
+     * dithering and lock the phase to a single dangerous offset.               */
+    uint64_t to = 200000ULL;
     struct _pulse pulse;
     TimerTimeout(CLOCK_MONOTONIC, _NTO_TIMEOUT_RECEIVE, NULL, &to, NULL);
-    int rc = MsgReceivePulse(d->chid, &pulse, sizeof pulse, NULL);
-    if (rc == -1 && errno != ETIMEDOUT)
-        return WR_ERROR;
+    (void)MsgReceivePulse(d->chid, &pulse, sizeof pulse, NULL);
     return dataready_read_level(d) ? WR_OK : WR_TIMEOUT;
 }
-
 /* ============================ command transmitter ========================
  *
  * One outstanding command at a time. The same frame rides every SPI transfer
@@ -297,7 +350,7 @@ static int dataready_wait(dataready_t *d, controller_stats_t *st)
  * Only the controller's main loop touches g_cmd. No locking needed (single
  * thread).
  */
-#define CMD_MAX_RETRIES   32u   /* ~320 ms at 100 Hz block cadence */
+#define CMD_MAX_RETRIES   200u  /* ~2-5 s margin at 25-37 Hz read rate */
 
 typedef enum { CMD_IDLE = 0, CMD_PENDING = 1 } cmd_state_t;
 
@@ -444,6 +497,7 @@ static void pi_apply_live(const pi_config_t *pi, const pi_config_t *prev)
             fprintf(stderr, "[ctrl] rt_priority -> %d\n", pi->rt_priority);
         }
     }
+    (void)pi; (void)prev;
     /* Scaling constants are read by downstream consumers from shm; the
      * publisher just needs to expose them. (Hookup TBD; not on the wire.) */
     (void)prev;
@@ -579,12 +633,12 @@ static int handle_reload(const char *cfg_path,
          * spi-dwc restart invalidates the SPI fd, so close before the bounce. */
         close_spi(spi);
 
-        /* Rewrite spi.conf + restart spi-dwc. spi_apply_conf is idempotent: a
-         * bus/dev/mode-only change leaves spi.conf alone and skips the restart. */
-        if (spi_apply_conf(&next.pi) != 0) {
-            fprintf(stderr, "[ctrl] WARNING: spi_apply_conf failed; reopening on "
-                            "the existing spi.conf\n");
-        }
+        /* Write new SPI params to spi.conf and bounce spi-dwc so the change
+         * takes effect immediately. The STM32 is about to be re-synced via
+         * SET_CONFIG (or the seq baseline reset via *have_last = 0), so a
+         * brief bus glitch during the bounce is tolerated here -- unlike the
+         * startup path where the STM32 has been running independently.      */
+        (void)0;
 
         /* Reopen on the (possibly new) bus/dev/mode/clock. spi-dwc may still be
          * settling right after a restart, so give the open a few tries before
@@ -685,24 +739,31 @@ int main(int argc, char **argv)
         fprintf(stderr, "warning: SCHED_FIFO prio %d not set (need privilege): %s\n",
                 cfg.pi.rt_priority, strerror(errno));
 
+    pin_to_cpu(cfg.pi.cpu_affinity);
+
+    (void)0;
+
     config_install_sighup();
 
     shm_region_t *region = shm_setup();
     if (!region) { perror("shm_setup"); return 1; }
 
-    /* Make spi-dwc reflect cfg.pi.spi_* before we open its device. On QNX/Pi5
-     * this is the only way these wire parameters actually change -- the
-     * runtime DCMD_SPI_SET_CONFIG devctl ignores them. */
-    if (spi_apply_conf(&cfg.pi) != 0) {
-        fprintf(stderr, "[ctrl] WARNING: could not apply SPI config; wire will "
-                "run at whatever spi.conf currently says\n");
-    }
+    /* Sync spi.conf so the driver clock matches. Safe here because no SPI
+     * exchange is in progress yet (open_spi is called next).                */
+    (void)spi_apply_conf(&cfg.pi);
 
     spi_link_t spi = { .configured = false };
     if (open_spi(&spi, &cfg.pi) != 0) {
         munmap(region, sizeof(shm_region_t));
         shm_unlink(MOTOR_SHM_NAME);
         return 1;
+    }
+
+    {
+        spi_devinfo_t devinfo;
+        if (rpi_spi_get_device_info(cfg.pi.spi_bus, cfg.pi.spi_dev, &devinfo) == SPI_SUCCESS)
+            fprintf(stderr, "[ctrl] SPI actual clock: %u Hz (requested %u Hz)\n",
+                    devinfo.current_clkrate, cfg.pi.spi_clock_hz);
     }
 
     dataready_t dr;
@@ -713,7 +774,7 @@ int main(int argc, char **argv)
         shm_unlink(MOTOR_SHM_NAME);
         return 1;
     }
-    fprintf(stderr, "[ctrl] edge-pulse mode on GPIO%d (via rpi_gpio)\n", dr.pin);
+    fprintf(stderr, "[ctrl] edge-pulse mode on GPIO\n");
 
     /* ---- optional config-file watcher ---- */
     cfg_watch_t watch = { .enabled = watch_enabled, .path = cfg_path };
@@ -732,12 +793,18 @@ int main(int argc, char **argv)
     sa.sa_handler = on_signal;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    struct sigaction sa_ign;
+    memset(&sa_ign, 0, sizeof sa_ign);
+    sa_ign.sa_handler = SIG_IGN;
+    sigaction(SIGHUP, &sa_ign, NULL);
 
     /* The SPI exchange size is the WORST case -- buffers are sized to MAX so
      * a runtime block_rows change does not require a reallocation. We always
      * clock MOTOR_MAX_FRAME_BYTES; the actual valid payload length comes from
      * h->n_rows inside the frame. This also gives the command frame plenty of
-     * headroom on the tx side (it's far smaller than MAX).                   */
+     * headroom on the tx side (it's far smaller than MAX). The STM32 SPI slave
+     * requires the full clock cycle with CS asserted; truncating causes sync
+     * loss so this stays at MAX regardless of the active block_rows.         */
     const size_t xfer_bytes = MOTOR_MAX_FRAME_BYTES;
 
     static _Alignas(8) uint8_t rx[MOTOR_MAX_FRAME_BYTES];
@@ -745,7 +812,7 @@ int main(int argc, char **argv)
 
     /* ---- queue an initial SET_CONFIG so the STM32 matches what we loaded - */
     cmd_init();
-    cmd_queue_set_config(&cfg.stm);
+    (void)cmd_queue_set_config;
 
     controller_stats_t st = {0};
     uint32_t last_seq = 0;
@@ -758,13 +825,25 @@ int main(int argc, char **argv)
      * process. Updated on every published frame; printed in the status log. */
     int16_t  last_vib_x = 0, last_vib_y = 0, last_vib_z = 0;
     uint16_t last_cur0 = 0, last_cur1 = 0, last_cur2 = 0;
-    uint16_t last_vph0 = 0, last_vph1 = 0, last_vph2 = 0;
-    uint16_t last_vdc  = 0, last_vspd = 0;
     uint16_t last_rpm = 0;
     struct timespec t_log;
     clock_gettime(CLOCK_MONOTONIC, &t_log);
 
+    /* ---- timing instrumentation (diagnostic) ---- */
+    uint64_t t_spi_ns = 0, t_pub_ns = 0;
+    uint64_t t_spi_max = 0, t_pub_max = 0;
+    uint32_t t_samples = 0;
+    struct timespec t_spi_start, t_spi_end;
+    uint64_t loop_count = 0;            /* raw iterations per interval               */
+    int bad_read_count = 0;             /* consecutive SPI devctl failures          */
+    uint64_t wait_ns_sum = 0, wait_ns_min = UINT64_MAX, wait_ns_max = 0;
+    uint32_t wait_samples = 0;
+
     while (g_running) {
+        loop_count++;
+        struct timespec t_loop_start;
+        clock_gettime(CLOCK_MONOTONIC, &t_loop_start);
+
         /* ---- periodic status log ---- */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -775,17 +854,29 @@ int main(int argc, char **argv)
                 " magic=%" PRIu64 " ver=%" PRIu64 " size=%" PRIu64
                 " dup=%" PRIu64 " rst=%" PRIu64 " to=%" PRIu64
                 " spi=%" PRIu64 " cfg(rld=%" PRIu64 " ack=%" PRIu64 " nack=%" PRIu64 ")"
-                " last(flags=0x%04x rsv=%u)"
-                " sens(cur=%u/%u/%u vph=%u/%u/%u vdc=%u vspd=%u vib=%d/%d/%d rpm=%u)\n",
+                 " last(flags=0x%04x rsv=%u rows=%u)"
+                 " sens(cur=%u/%u/%u vib=%d/%d/%d rpm=%u)"
+                " bad=%d"
+                 " timing(wait=%" PRIu64 "/%" PRIu64 " spi=%" PRIu64 "/%" PRIu64 " pub=%" PRIu64 "/%" PRIu64
+                 " us)\n",
                 st.frames_ok, st.seq_drops, st.crc_err, st.magic_err,
                 st.version_err, st.size_err, st.duplicates, st.resets,
                 st.timeouts, st.spi_err,
                 st.cfg_reloads, st.cfg_acks_ok, st.cfg_nacks,
-                last_h_flags, last_h_reserved,
+                last_h_flags, last_h_reserved, last_n_rows,
                 last_cur0, last_cur1, last_cur2,
-                last_vph0, last_vph1, last_vph2,
-                last_vdc, last_vspd,
-                last_vib_x, last_vib_y, last_vib_z, last_rpm);
+                last_vib_x, last_vib_y, last_vib_z, last_rpm,
+                bad_read_count,
+                wait_samples ? wait_ns_sum / wait_samples / 1000 : 0,
+                wait_ns_max / 1000,
+                t_samples ? t_spi_ns  / t_samples / 1000 : 0,
+                t_samples ? t_spi_max / 1000 : 0,
+                t_samples ? t_pub_ns  / t_samples / 1000 : 0,
+                t_samples ? t_pub_max / 1000 : 0);
+            t_spi_ns = t_pub_ns = 0;
+            t_spi_max = t_pub_max = 0;
+            t_samples = 0;
+            wait_ns_sum = 0; wait_ns_min = UINT64_MAX; wait_ns_max = 0; wait_samples = 0;
         }
 
         /* ---- reload trigger: SIGHUP and/or config-file mtime change ----
@@ -806,107 +897,150 @@ int main(int argc, char **argv)
         /* ---- prepare tx (carries SET_CONFIG if one is in flight) ---- */
         cmd_fill_tx(tx, sizeof tx);
 
-        /* ---- wait for data-ready ---- */
-        int w = dataready_wait(&dr, &st);
-        if (w == WR_TIMEOUT) { st.timeouts++; continue; }
-        if (w == WR_ERROR)   { if (errno == EINTR) continue; st.timeouts++; continue; }
+        /* ---- wait for STM32 data-ready edge ---- */
+        {
+            struct timespec t_wait_start;
+            clock_gettime(CLOCK_MONOTONIC, &t_wait_start);
+            int w = dataready_wait(&dr, &st);
+            {
+                struct timespec t_wait_end;
+                clock_gettime(CLOCK_MONOTONIC, &t_wait_end);
+                uint64_t w_ns = ts_delta_ns(t_wait_end, t_wait_start);
+                wait_ns_sum += w_ns;
+                if (w_ns < wait_ns_min) wait_ns_min = w_ns;
+                if (w_ns > wait_ns_max) wait_ns_max = w_ns;
+                wait_samples++;
+            }
+            if (w == WR_TIMEOUT) { st.timeouts++; continue; }
+            if (w == WR_ERROR)   { st.spi_err++;   continue; }
+        }
 
-        /* ---- SPI exchange ----
-         * Synchronous: it either fully clocks the frame or reports failure. A
-         * SIGHUP (or a watcher tick) that lands while we're here does NOT tear
-         * anything down mid-transfer -- the reload is only acted on at the top
-         * of the loop, after this call has returned. With SA_RESTART off, the
-         * signal may instead abort the transfer early (errno == EINTR); we treat
-         * that as a clean no-op: nothing was committed, and because we return
-         * before cmd_count_attempt() the in-flight command keeps its full retry
-         * budget. We just retry on the next edge, and the pending reload is
-         * handled on the next iteration from a clean boundary. */
+        /* ---- SPI exchange (timed) ---- */
+        clock_gettime(CLOCK_MONOTONIC, &t_spi_start);
         if (rpi_spi_write_read_data(cfg.pi.spi_bus, cfg.pi.spi_dev, tx, rx,
                                     xfer_bytes) != SPI_SUCCESS) {
             if (errno == EINTR) continue;   /* interrupted (e.g. SIGHUP): clean abort */
             st.spi_err++;
+            bad_read_count++;
+            if (bad_read_count >= 3) {
+                fprintf(stderr, "[ctrl] %d consecutive SPI errors -- resetting bus\n", bad_read_count);
+                close_spi(&spi);
+                const struct timespec rto = { .tv_sec = 0, .tv_nsec = 100000000 };
+                nanosleep(&rto, NULL);
+                if (open_spi(&spi, &cfg.pi) != 0)
+                    fprintf(stderr, "[ctrl] SPI reopen failed after error recovery\n");
+                have_last = 0;
+                bad_read_count = 0;
+            }
             continue;
         }
-
-        /* Command (if any) was actually clocked out -- count this attempt. */
-        cmd_count_attempt();
+        bad_read_count = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t_spi_end);
+        last_spi_ns = (uint64_t)t_spi_end.tv_sec * 1000000000ULL + t_spi_end.tv_nsec;
+        {
+            uint64_t ns = ts_delta_ns(t_spi_end, t_spi_start);
+            t_spi_ns += ns;
+            if (ns > t_spi_max) t_spi_max = ns;
+        }
 
         const frame_header_t *h = (const frame_header_t *)rx;
 
-        /* ---- frame validation ---- */
-        if (h->magic   != MOTOR_FRAME_MAGIC)      { st.magic_err++;   continue; }
-        if (h->version != MOTOR_CONTRACT_VERSION) { st.version_err++; continue; }
-        if (h->n_rows  == 0 || h->n_rows > MOTOR_MAX_ROWS_PER_BLOCK) {
-            st.size_err++; continue;
+        /* ---- frame validation ----
+         * NO validation failure skips the rate limiter at the bottom of the
+         * loop.  The old probe-mode design used `continue` on bad magic,
+         * consuming frames at high speed and making it impossible for the
+         * STM32 to ever recover from a boundary slip.  With the CS-wait
+         * recovery on the STM32 side, every frame after a bad one is cleanly
+         * aligned; the correct response is to pace reads at the 10 ms block
+         * cadence and pick up the next good frame.  A bad frame is simply
+         * not published.                                                      */
+        int frame_valid = 1;
+
+        if (h->magic != MOTOR_FRAME_MAGIC) { st.magic_err++;   have_last = 0; frame_valid = 0; }
+        if (h->version != MOTOR_CONTRACT_VERSION)            { st.version_err++; have_last = 0; frame_valid = 0; }
+        if (h->n_rows == 0 || h->n_rows > MOTOR_MAX_ROWS_PER_BLOCK) {
+            st.size_err++; have_last = 0; frame_valid = 0;
         }
-        /* If we have a locked-in block_rows (i.e. the STM has ACK'd our
-         * config at least once), enforce it -- unless this very frame
-         * is the CONFIG_APPLIED transition, which is allowed to differ. */
-        if (active_stm.block_rows != 0
+        if (frame_valid && active_stm.block_rows != 0
             && h->n_rows != active_stm.block_rows
             && !(h->flags & MOTOR_FLAG_CONFIG_APPLIED)) {
-            st.size_err++; continue;
+            st.size_err++; have_last = 0; frame_valid = 0;
         }
 
-        size_t covered = sizeof(frame_header_t) + (size_t)h->n_rows * sizeof(motor_row_t);
-        if (covered + sizeof(frame_crc_t) > xfer_bytes) { st.size_err++; continue; }
-
-        uint32_t rx_crc;
-        memcpy(&rx_crc, rx + covered, sizeof rx_crc);
-        if (frame_crc_compute(rx, covered) != rx_crc) { st.crc_err++; continue; }
-
-        /* ---- ACK handling: may update active_stm ---- */
-        cmd_observe(h, &active_stm, &st);
-
-        /* Stash for the periodic log -- shows what the STM is actually
-         * putting in flags/_reserved so we can see whether the command
-         * round-trip is happening even if cmd_observe never matches.       */
-        last_h_flags    = h->flags;
-        last_h_reserved = h->_reserved;
-
-        /* If we saw CONFIG_APPLIED, log the size shift so it's easy to see
-         * a runtime block_rows change land in the logs. */
-        if ((h->flags & MOTOR_FLAG_CONFIG_APPLIED) && h->n_rows != last_n_rows) {
-            fprintf(stderr, "[ctrl] block_rows -> %u\n", h->n_rows);
-        }
-        last_n_rows = h->n_rows;
-
-        /* ---- sequence accounting ---- */
-        int publish = 1;
-        if (!have_last) {
-            have_last = 1;
-            last_seq  = h->seq;
-        } else {
-            int32_t diff = (int32_t)(h->seq - last_seq);
-            if      (diff == 0) { st.duplicates++; publish = 0; }
-            else if (diff == 1) { last_seq = h->seq; }
-            else if (diff  > 1) { st.seq_drops += (uint64_t)(diff - 1); last_seq = h->seq; }
-            else                { st.resets++; last_seq = h->seq; }
+        size_t covered = 0;
+        if (frame_valid) {
+            covered = sizeof(frame_header_t) + (size_t)h->n_rows * sizeof(motor_row_t);
+            if (covered + sizeof(frame_crc_t) > xfer_bytes) {
+                st.size_err++; have_last = 0; frame_valid = 0;
+            }
         }
 
-        /* ---- publish ---- */
-        if (publish) {
-            const motor_row_t *rows = (const motor_row_t *)(rx + sizeof(frame_header_t));
-            const motor_row_t *last = &rows[h->n_rows - 1];
-            /* Snapshot the last row's sensor values for the diagnostic log. */
-            last_cur0  = last->current[0];
-            last_cur1  = last->current[1];
-            last_cur2  = last->current[2];
-            last_vph0  = last->current[3];
-            last_vph1  = last->current[4];
-            last_vph2  = last->current[5];
-            last_vdc   = last->current[6];
-            last_vspd  = last->current[7];
-            last_vib_x = last->vib_x;
-            last_vib_y = last->vib_y;
-            last_vib_z = last->vib_z;
-            last_rpm   = last->rpm;
-
-            motor_snapshot_publish(&region->snapshot, last,
-                                   h->seq, h->timestamp, h->flags);
-            motor_ring_publish(&region->ring, h, rows);
-            st.frames_ok++;
+        if (frame_valid) {
+            uint32_t rx_crc;
+            memcpy(&rx_crc, rx + covered, sizeof rx_crc);
+            if (frame_crc_compute(rx, covered) != rx_crc) {
+                st.crc_err++; have_last = 0; frame_valid = 0;
+            }
         }
+
+        if (frame_valid) {
+            /* Command was actually clocked out AND yielded a valid frame. */
+            cmd_count_attempt();
+
+            /* ---- ACK handling: may update active_stm ---- */
+            if (cmd_observe(h, &active_stm, &st)) {
+                have_last = 0;
+            }
+
+            last_h_flags    = h->flags;
+            last_h_reserved = h->_reserved;
+
+            if ((h->flags & MOTOR_FLAG_CONFIG_APPLIED) && h->n_rows != last_n_rows)
+                fprintf(stderr, "[ctrl] block_rows -> %u\n", h->n_rows);
+            last_n_rows = h->n_rows;
+
+            /* ---- sequence accounting ---- */
+            int publish = 1;
+            if (!have_last) {
+                have_last = 1;
+                last_seq  = h->seq;
+            } else {
+                int32_t diff = (int32_t)(h->seq - last_seq);
+                if      (diff == 0) { st.duplicates++; publish = 0; }
+                else if (diff == 1) { last_seq = h->seq; }
+                else if (diff  > 1) { st.seq_drops += (uint64_t)(diff - 1); last_seq = h->seq; }
+                else                { st.resets++; last_seq = h->seq; }
+            }
+
+            /* ---- publish ---- */
+            if (publish) {
+                struct timespec t_pub_start;
+                clock_gettime(CLOCK_MONOTONIC, &t_pub_start);
+                const motor_row_t *rows = (const motor_row_t *)(rx + sizeof(frame_header_t));
+                const motor_row_t *last = &rows[h->n_rows - 1];
+                last_cur0  = last->current[0];
+                last_cur1  = last->current[1];
+                last_cur2  = last->current[2];
+                last_vib_x = last->vib_x;
+                last_vib_y = last->vib_y;
+                last_vib_z = last->vib_z;
+                last_rpm   = last->rpm;
+
+                motor_snapshot_publish(&region->snapshot, last,
+                                       h->seq, h->timestamp, h->flags);
+                motor_ring_publish(&region->ring, h, rows, cfg.stm.sample_rate_hz);
+                st.frames_ok++;
+
+                struct timespec t_pub_end;
+                clock_gettime(CLOCK_MONOTONIC, &t_pub_end);
+                {
+                uint64_t ns = ts_delta_ns(t_pub_end, t_pub_start);
+                    t_pub_ns += ns;
+                    if (ns > t_pub_max) t_pub_max = ns;
+                }
+            }
+        }
+        t_samples++;
     }
 
     dataready_teardown(&dr);

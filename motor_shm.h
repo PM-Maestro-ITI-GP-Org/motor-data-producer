@@ -46,9 +46,10 @@ typedef struct {
 typedef struct {
     _Alignas(MOTOR_CACHELINE) _Atomic uint32_t seq; /* odd while producer writes */
     uint32_t     producer_seq;   /* frame seq stored in this slot */
-    uint64_t     timestamp;
+    uint64_t     timestamp;      /* block-level timestamp (row 0) */
     uint16_t     n_rows;
     uint16_t     flags;
+    uint64_t     row_ts[MOTOR_MAX_ROWS_PER_BLOCK]; /* per-row timestamps (us) */
     motor_row_t  rows[MOTOR_MAX_ROWS_PER_BLOCK];
 } shm_block_t;
 
@@ -136,10 +137,13 @@ static inline bool motor_snapshot_read(const shm_snapshot_t *s,
 }
 
 /* ============================ block-ring helpers ========================== */
-/* PRODUCER: write one block into the next slot, then publish it. */
+/* PRODUCER: write one block into the next slot, then publish it.
+ * `sample_rate_hz` is used to derive per-row timestamps from the block timestamp:
+ *     row_ts[i] = hdr->timestamp + i * (1,000,000 / sample_rate_hz)          */
 static inline void motor_ring_publish(shm_block_ring_t *ring,
                                       const frame_header_t *hdr,
-                                      const motor_row_t *rows)
+                                      const motor_row_t *rows,
+                                      uint32_t sample_rate_hz)
 {
     uint64_t pos  = atomic_load_explicit(&ring->write_pos, memory_order_relaxed);
     shm_block_t *slot = &ring->slots[pos % ring->depth];
@@ -154,7 +158,12 @@ static inline void motor_ring_publish(shm_block_ring_t *ring,
     slot->timestamp    = hdr->timestamp;
     slot->n_rows       = n;
     slot->flags        = hdr->flags;
-    for (uint16_t i = 0; i < n; ++i) slot->rows[i] = rows[i];
+
+    uint64_t interval = (sample_rate_hz > 0u) ? (1000000ULL / sample_rate_hz) : 0ULL;
+    for (uint16_t i = 0; i < n; ++i) {
+        slot->row_ts[i] = hdr->timestamp + (uint64_t)i * interval;
+        slot->rows[i]   = rows[i];
+    }
 
     atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&slot->seq, s0 + 2u, memory_order_relaxed); /* -> even */
@@ -179,7 +188,10 @@ static inline bool motor_ring_read_slot(const shm_block_ring_t *ring,
         out->timestamp    = slot->timestamp;
         out->n_rows       = n;
         out->flags        = slot->flags;
-        for (uint16_t i = 0; i < n; ++i) out->rows[i] = slot->rows[i];
+        for (uint16_t i = 0; i < n; ++i) {
+            out->row_ts[i] = slot->row_ts[i];
+            out->rows[i]   = slot->rows[i];
+        }
         atomic_thread_fence(memory_order_acquire);
         uint32_t s2 = atomic_load_explicit(&slot->seq, memory_order_relaxed);
         if (s1 == s2) return true;             /* not overwritten mid-copy */

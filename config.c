@@ -40,7 +40,8 @@ const full_config_t CONFIG_DEFAULTS = {
         .spi_word_width  = 8,
         .spi_idle_insert = 0,
         .rt_priority     = 30,
-        .dataready_pin   = 17,
+        .cpu_affinity    = -1,    /* default: no pinning */
+        .dataready_pin   = 27,
         .current_scale   = 1.0f,  .current_offset = 0.0f,
         .vib_scale       = 1.0f,  .vib_offset     = 0.0f,
         .rpm_scale       = 1.0f,  .rpm_offset     = 0.0f,
@@ -273,6 +274,7 @@ int config_load_file(const char *path, full_config_t *out)
         if (j_int (pi, "spi_word_width",  &cfg.pi.spi_word_width,  8, 32,       false) < 0) goto bad;
         if (j_int (pi, "spi_idle_insert", &cfg.pi.spi_idle_insert, 0, 1,        false) < 0) goto bad;
         if (j_int (pi, "rt_priority",     &cfg.pi.rt_priority,     1, 63,       false) < 0) goto bad;
+        if (j_int (pi, "cpu_affinity",   &cfg.pi.cpu_affinity,   -1, 7,        false) < 0) goto bad;
         if (j_int (pi, "dataready_pin",   &cfg.pi.dataready_pin,   0, 27,       false) < 0) goto bad;
 
         /* word_width must be 8, 16, or 32 -- the j_int range check above
@@ -338,15 +340,17 @@ bad:
 }
 
 /* ============================ spi.conf rewrite ============================
- * Edit /system/etc/spi.conf so the keys we care about match the loaded JSON
+ * Edit /tmp/spi.conf so the keys we care about match the loaded JSON
  * config, then bounce spi-dwc to make the new values stick. If nothing
  * differs, do nothing -- avoids gratuitous driver restarts.
  *
  * Strategy: walk the file line-by-line; for any line whose key matches one
  * of our targets, replace its value; pass everything else through unchanged.
  * Write to a tmp file, then atomic rename. Then `slay spi-dwc` and respawn.
+ *
+ * NB: /var is guaranteed writable on this QNX image; /system/etc may not exist.
  */
-#define SPI_CONF_PATH "/system/etc/spi.conf"
+#define SPI_CONF_PATH "/var/spi.conf"
 
 /* A small (key, target value) pair so we can drive both read-diff and rewrite
  * passes with the same data. We only touch numeric integer fields.            */
@@ -375,59 +379,67 @@ static int read_current_kv(const char *key, uint32_t *out)
     return -1;
 }
 
+static int ensure_parent_dir(const char *path)
+{
+    char dir[256];
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash == path) return 0;
+    size_t len = (size_t)(slash - path);
+    if (len >= sizeof dir) return -1;
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
 static int rewrite_spi_conf(const spi_kv_t *kv, size_t n)
 {
-    FILE *in = fopen(SPI_CONF_PATH, "r");
-    if (!in) {
-        fprintf(stderr, "spi.conf: open for read failed: %s\n", strerror(errno));
-        return -1;
+    if (ensure_parent_dir(SPI_CONF_PATH) != 0) {
+        fprintf(stderr, "spi.conf: cannot create parent dir: %s\n", strerror(errno));
     }
     char tmp_path[] = SPI_CONF_PATH ".tmp.XXXXXX";
     int tfd = mkstemp(tmp_path);
     if (tfd < 0) {
         fprintf(stderr, "spi.conf: mkstemp failed: %s\n", strerror(errno));
-        fclose(in);
         return -1;
     }
     FILE *out = fdopen(tfd, "w");
-    if (!out) { close(tfd); fclose(in); return -1; }
+    if (!out) { close(tfd); return -1; }
 
-    /* Per-key "did we hit this in the file" tracking so we can report any
-     * missing keys; the file template should already contain placeholders
-     * for everything we care about, but defensive code is cheap.            */
+    /* Try to read the existing file for in-place key replacement. If it
+     * doesn't exist (first run), create from scratch with all desired keys. */
+    FILE *in = fopen(SPI_CONF_PATH, "r");
     int hit[16] = {0};
     if (n > 16) n = 16;
 
-    char line[256];
-    while (fgets(line, sizeof line, in)) {
-        const char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        int matched = 0;
-        for (size_t i = 0; i < n; ++i) {
-            size_t klen = strlen(kv[i].key);
-            if (strncmp(p, kv[i].key, klen) == 0 && p[klen] == '=') {
-                fprintf(out, "%s=%u\n", kv[i].key, (unsigned)kv[i].val);
-                hit[i] = 1;
-                matched = 1;
-                break;
+    if (in) {
+        char line[256];
+        while (fgets(line, sizeof line, in)) {
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            int matched = 0;
+            for (size_t i = 0; i < n; ++i) {
+                size_t klen = strlen(kv[i].key);
+                if (strncmp(p, kv[i].key, klen) == 0 && p[klen] == '=') {
+                    fprintf(out, "%s=%u\n", kv[i].key, (unsigned)kv[i].val);
+                    hit[i] = 1;
+                    matched = 1;
+                    break;
+                }
             }
+            if (!matched) fputs(line, out);
         }
-        if (!matched) fputs(line, out);
+        fclose(in);
     }
-    fclose(in);
-    if (fclose(out) != 0) { unlink(tmp_path); return -1; }
 
-    int missing = 0;
+    /* Append any keys that weren't found in the existing file. */
     for (size_t i = 0; i < n; ++i) {
         if (!hit[i]) {
-            fprintf(stderr, "spi.conf: WARNING -- no '%s=' line found\n", kv[i].key);
-            missing = 1;
+            fprintf(out, "%s=%u\n", kv[i].key, (unsigned)kv[i].val);
         }
     }
-    if (missing) {
-        /* Don't refuse, but flag it: maybe the user has a stripped-down
-         * spi.conf and our default for that field is fine.                 */
-    }
+
+    if (fclose(out) != 0) { unlink(tmp_path); return -1; }
 
     if (rename(tmp_path, SPI_CONF_PATH) != 0) {
         fprintf(stderr, "spi.conf: rename failed: %s\n", strerror(errno));

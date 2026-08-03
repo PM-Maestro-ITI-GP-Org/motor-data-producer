@@ -1,5 +1,5 @@
 /*
- * pd_test.c -- data-ready (GPIO17) level monitor, via the rpi_gpio server
+ * pd_test.c -- data-ready (GPIO27) level monitor, via the rpi_gpio server
  * ----------------------------------------------------------------------------
  * Standalone diagnostic for the data-ready handshake. It configures the pin as
  * an input with an internal pull-DOWN and then polls the LIVE level through the
@@ -33,7 +33,7 @@
 
 #include "rpi_gpio.h"
 
-#define GPIO_PIN   17
+#define GPIO_PIN   27
 #define POLL_MS    20
 
 static volatile sig_atomic_t g_running = 1;
