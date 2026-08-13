@@ -324,18 +324,44 @@ static inline uint64_t ts_delta_ns(struct timespec end, struct timespec start)
 static int dataready_wait(dataready_t *d, controller_stats_t *st)
 {
     (void)st;
-    /* Wait 200 us (via kernel timer) then sample the GPIO level.
-     * TimerTimeout() on the QNX guest VM is rounded by the 1 ms system tick,
-     * adding 100-1000 us of jitter to every poll.  This natural jitter acts as
-     * phase dithering, spreading the Pi's SPI reads across many offsets within
-     * the STM32's 10 ms block window and dramatically reducing the chance of
-     * repeatedly hitting the DMA boundary.  Deterministic waits lack this
-     * dithering and lock the phase to a single dangerous offset.               */
-    uint64_t to = 200000ULL;
+    /* Wait for the RISING EDGE, not the level.
+     *
+     * The level is ambiguous. The STM32 holds data-ready high for the whole
+     * transfer and the line only dips between frames, so a poll sampling about
+     * once a millisecond sees one continuous high and cannot tell frame N from
+     * N+1. Reads issued on that stale high land before the slave has armed its
+     * DMA, and a dump of a failing read shows exactly that: a run of one
+     * repeated byte -- the SPI data register handing back the same stale value
+     * for every clock -- then the real frame, intact, 1 to 386 bytes in.
+     *
+     * The edge is unambiguous: one pulse per armed frame. The subscription
+     * already exists (rpi_gpio_add_event_detect with GPIO_RISING, delivering to
+     * this channel); it was created and then never actually waited on.
+     *
+     * MsgReceivePulse returns 0 on a real pulse, -1 when the timer wins.
+     *
+     * The fallback matters: if an edge is ever missed, waiting for it forever
+     * would stall on a frame that has already passed. After DR_MISS_LIMIT
+     * consecutive timeouts with the line still high, take the level instead --
+     * the old behaviour, kept as a floor rather than as the normal path. */
+    enum { DR_MISS_LIMIT = 2 };
+    static int misses = 0;
+
+    uint64_t to = 250000ULL;           /* 250 us: prefer the edge, but do not
+                                        * spend a whole block period waiting */
     struct _pulse pulse;
     TimerTimeout(CLOCK_MONOTONIC, _NTO_TIMEOUT_RECEIVE, NULL, &to, NULL);
-    (void)MsgReceivePulse(d->chid, &pulse, sizeof pulse, NULL);
-    return dataready_read_level(d) ? WR_OK : WR_TIMEOUT;
+
+    if (MsgReceivePulse(d->chid, &pulse, sizeof pulse, NULL) == 0) {
+        misses = 0;
+        return WR_OK;                  /* a frame was just armed */
+    }
+
+    if (++misses >= DR_MISS_LIMIT && dataready_read_level(d)) {
+        misses = 0;
+        return WR_OK;                  /* edge missed; fall back to the level */
+    }
+    return WR_TIMEOUT;
 }
 /* ============================ command transmitter ========================
  *
