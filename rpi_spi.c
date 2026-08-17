@@ -194,13 +194,31 @@ int rpi_spi_write_read_data(unsigned bus_number, unsigned device_number,
         return SPI_ERROR_BAD_ARGUMENT;
     }
 
-    // Allocate memory for the message
+    /* Reuse a static exchange buffer instead of malloc/free on every transfer.
+     * At ~100 transfers/s the heap traffic is pure latency and jitter: a
+     * malloc page-fault or allocator stall under the hypervisor can push a
+     * transfer past the STM32's 10 ms block period, dropping a frame (a seq
+     * gap at the controller). One transfer at a time by contract -- the fd
+     * mutex already serialises access to the device -- so a static buffer is
+     * safe. Larger-than-static transfers fall back to a heap buffer.        */
+    enum { SPI_STATIC_XCHG_MAX = 16u * 1024u };
+    static _Alignas(8) uint8_t static_buf[sizeof(spi_xchng_t) + SPI_STATIC_XCHG_MAX];
     spi_xchng_t *spi_xchng_msg = NULL;
-    spi_xchng_msg = malloc(sizeof(spi_xchng_t) + data_size); // allocate enough memory for the data
-    if (!spi_xchng_msg)
+    uint8_t     *dyn           = NULL;
+
+    if (sizeof(spi_xchng_t) + data_size <= sizeof static_buf)
     {
-        perror("alloc failed");
-        return -1;
+        spi_xchng_msg = (spi_xchng_t *)static_buf;
+    }
+    else
+    {
+        dyn = malloc(sizeof(spi_xchng_t) + data_size);
+        if (!dyn)
+        {
+            perror("alloc failed");
+            return -1;
+        }
+        spi_xchng_msg = (spi_xchng_t *)dyn;
     }
 
     // Add the data to write
@@ -214,7 +232,7 @@ int rpi_spi_write_read_data(unsigned bus_number, unsigned device_number,
     err = devctl(spi_device_fd[bus_number][device_number], DCMD_SPI_DATA_XCHNG, spi_xchng_msg, sizeof(spi_xchng_t) + data_size, NULL);
     if (err != EOK)
     {
-        free(spi_xchng_msg);
+        free(dyn);
         fprintf(stderr, "error: %d\n", err);
         perror("devctl");
         return SPI_ERROR_OPERATION_FAILED;
@@ -230,7 +248,7 @@ int rpi_spi_write_read_data(unsigned bus_number, unsigned device_number,
     }
 
     // Free allocated message
-    free(spi_xchng_msg);
+    free(dyn);
 
     return SPI_SUCCESS;
 }
