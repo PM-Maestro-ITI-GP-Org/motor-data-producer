@@ -1,1 +1,4 @@
 build_qnx/
+*.o
+motor_controller
+motor_recorder

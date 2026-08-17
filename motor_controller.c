@@ -91,6 +91,10 @@ typedef struct {
     uint64_t cfg_reloads;
     uint64_t cfg_acks_ok;
     uint64_t cfg_nacks;
+    uint64_t sample_ovr;   /* frames flagged MOTOR_FLAG_SAMPLE_OVERRUN (STM ADC DMA
+                              overrun lost a conversion -> boundary phase step) */
+    uint64_t block_drop;  /* frames flagged MOTOR_FLAG_BLOCK_DROPPED (STM dropped
+                              a whole block before sending -- invisible to seq) */
 } controller_stats_t;
 
 /* ============================ CRC-32/MPEG-2 ==============================
@@ -879,7 +883,8 @@ int main(int argc, char **argv)
                 "[ctrl] ok=%" PRIu64 " drops=%" PRIu64 " crc=%" PRIu64
                 " magic=%" PRIu64 " ver=%" PRIu64 " size=%" PRIu64
                 " dup=%" PRIu64 " rst=%" PRIu64 " to=%" PRIu64
-                " spi=%" PRIu64 " cfg(rld=%" PRIu64 " ack=%" PRIu64 " nack=%" PRIu64 ")"
+                " spi=%" PRIu64 " ovr=%" PRIu64 " bdrop=%" PRIu64
+                " cfg(rld=%" PRIu64 " ack=%" PRIu64 " nack=%" PRIu64 ")"
                  " last(flags=0x%04x rsv=%u rows=%u)"
                  " sens(cur=%u/%u/%u vib=%d/%d/%d rpm=%u)"
                 " bad=%d"
@@ -888,6 +893,7 @@ int main(int argc, char **argv)
                 st.frames_ok, st.seq_drops, st.crc_err, st.magic_err,
                 st.version_err, st.size_err, st.duplicates, st.resets,
                 st.timeouts, st.spi_err,
+                st.sample_ovr, st.block_drop,
                 st.cfg_reloads, st.cfg_acks_ok, st.cfg_nacks,
                 last_h_flags, last_h_reserved, last_n_rows,
                 last_cur0, last_cur1, last_cur2,
@@ -1024,6 +1030,10 @@ int main(int argc, char **argv)
             if ((h->flags & MOTOR_FLAG_CONFIG_APPLIED) && h->n_rows != last_n_rows)
                 fprintf(stderr, "[ctrl] block_rows -> %u\n", h->n_rows);
             last_n_rows = h->n_rows;
+            if (h->flags & MOTOR_FLAG_SAMPLE_OVERRUN)
+                st.sample_ovr++;
+            if (h->flags & MOTOR_FLAG_BLOCK_DROPPED)
+                st.block_drop++;
 
             /* ---- sequence accounting ---- */
             int publish = 1;
@@ -1074,8 +1084,9 @@ int main(int argc, char **argv)
     munmap(region, sizeof(shm_region_t));
     shm_unlink(MOTOR_SHM_NAME);
     fprintf(stderr, "[ctrl] shutdown: ok=%" PRIu64 " drops=%" PRIu64
-                    " crc=%" PRIu64 " cfg_ack=%" PRIu64 " cfg_nack=%" PRIu64 "\n",
-            st.frames_ok, st.seq_drops, st.crc_err,
+                    " crc=%" PRIu64 " ovr=%" PRIu64 " bdrop=%" PRIu64
+                    " cfg_ack=%" PRIu64 " cfg_nack=%" PRIu64 "\n",
+            st.frames_ok, st.seq_drops, st.crc_err, st.sample_ovr, st.block_drop,
             st.cfg_acks_ok, st.cfg_nacks);
     return 0;
 }

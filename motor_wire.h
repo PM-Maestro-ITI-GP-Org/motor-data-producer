@@ -109,7 +109,17 @@ typedef uint32_t frame_crc_t;
 #define MOTOR_FLAG_NACK_VER       0x0010u  /* schema_version not supported by fw   */
 #define MOTOR_FLAG_NACK_CMD       0x0020u  /* unknown cmd opcode                   */
 #define MOTOR_FLAG_CONFIG_APPLIED 0x0040u  /* this is the FIRST frame using the    */
-                                           /* newly applied config                 */
+                                            /* newly applied config                 */
+#define MOTOR_FLAG_SAMPLE_OVERRUN 0x0080u  /* at least one ADC sample was lost to a */
+                                           /* DMA overrun since the last frame; the */
+                                           /* boundary rows of this block are       */
+                                           /* phase-shifted and may show a step     */
+#define MOTOR_FLAG_BLOCK_DROPPED  0x0100u  /* at least one complete block was       */
+                                           /* dropped on this STM since the last    */
+                                           /* frame (pool full, or arm_tx gave up   */
+                                           /* after 50 tries) -- that block never   */
+                                           /* consumed a seq, so it is invisible    */
+                                           /* to the Pi's seq check                 */
 /* future producer flags (ZOH-stale, overrun, ...) take the upper bits         */
 
 /* ============================ command / config protocol ==================
